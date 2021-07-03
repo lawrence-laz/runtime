@@ -49,7 +49,8 @@ namespace Microsoft.Extensions.DependencyInjection
                 instanceType,
                 argumentTypes,
                 out ConstructorInfo? constructor,
-                out int?[]? matchingParameterMap);
+                out int?[]? matchingParameterMap,
+                provider);
 
             return CreateInstance(constructor, parameters, provider, matchingParameterMap);
         }
@@ -182,14 +183,15 @@ namespace Microsoft.Extensions.DependencyInjection
             [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] Type instanceType,
             Type[] argumentTypes,
             out ConstructorInfo matchingConstructor,
-            out int?[] matchingParameterMap)
+            out int?[] matchingParameterMap,
+            IServiceProvider provider)
         {
             ConstructorInfo? constructorInfo = null;
             int?[]? parameterMap = null;
 
             if (instanceType.IsAbstract ||
                 (!TryFindPreferredConstructor(instanceType, argumentTypes, ref constructorInfo, ref parameterMap) &&
-                !TryFindMatchingConstructor(instanceType, argumentTypes, ref constructorInfo, ref parameterMap)))
+                !TryFindMatchingConstructor(instanceType, argumentTypes, provider, ref constructorInfo, ref parameterMap)))
             {
                 string? message = $"A suitable constructor for type '{instanceType}' could not be located. Ensure the type is concrete and all parameters of a public constructor are either registered as services or passed as arguments. Also ensure no extraneous arguments are provided.";
                 throw new InvalidOperationException(message);
@@ -203,25 +205,41 @@ namespace Microsoft.Extensions.DependencyInjection
         private static bool TryFindMatchingConstructor(
             [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] Type instanceType,
             Type[] argumentTypes,
+            IServiceProvider provider,
             [NotNullWhen(true)] ref ConstructorInfo? matchingConstructor,
             [NotNullWhen(true)] ref int?[]? parameterMap)
         {
-            int unresolvedParameters = int.MaxValue;
+            int longestParameterLength = 0;
+            int constructorsWithSameParameterCount = 0;
+            IServiceProviderIsService? isService = provider.GetService<IServiceProviderIsService>();
 
             foreach (ConstructorInfo? constructor in instanceType.GetConstructors())
             {
                 ParameterInfo[] parameters = constructor.GetParameters();
                 if (TryCreateParameterMap(parameters, argumentTypes, out int?[] tempParameterMap))
                 {
-                    var tempUnresolvedParameters = CountUnresolvedParameters(parameters, tempParameterMap);
-                    if (tempUnresolvedParameters < unresolvedParameters
-                        || (tempUnresolvedParameters == unresolvedParameters && tempParameterMap.Length > parameterMap.Length))
+                    if (isService != null && HasUnresolvedParameters(parameters, tempParameterMap, isService))
+                    {
+                        continue;
+                    }
+
+                    if (parameters.Length > longestParameterLength)
                     {
                         matchingConstructor = constructor;
                         parameterMap = tempParameterMap;
-                        unresolvedParameters = tempUnresolvedParameters;
+                        longestParameterLength = parameters.Length;
+                        constructorsWithSameParameterCount = 0;
+                    }
+                    else if (parameters.Length == longestParameterLength)
+                    {
+                        ++constructorsWithSameParameterCount;
                     }
                 }
+            }
+
+            if (constructorsWithSameParameterCount > 0)
+            {
+                throw new Exception("uh oh, throw ambiguous ctors found.");
             }
 
             if (matchingConstructor != null)
@@ -233,21 +251,24 @@ namespace Microsoft.Extensions.DependencyInjection
             return false;
         }
 
-        private static int CountUnresolvedParameters(ParameterInfo[] parameters, int?[] parameterMap)
+        private static bool HasUnresolvedParameters(
+            ParameterInfo[] parameters,
+            int?[] parameterMap,
+            IServiceProviderIsService? isService)
         {
-            int unresolvedParameters = 0;
             for (int index = 0; index < parameters.Length; ++index)
             {
-                if (ParameterDefaultValue.TryGetDefaultValue(parameters[index], out object? _)
+                if (isService?.IsService(parameters[index].ParameterType) == true
+                    || ParameterDefaultValue.TryGetDefaultValue(parameters[index], out object? _)
                     || parameterMap[index].HasValue)
                 {
                     continue;
                 }
 
-                ++unresolvedParameters;
+                return true;
             }
 
-            return unresolvedParameters;
+            return false;
         }
 
         // Tries to find constructor marked with ActivatorUtilitiesConstructorAttribute
